@@ -3,6 +3,7 @@ import time
 import os
 import sys
 import json
+import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
@@ -15,6 +16,13 @@ client_manager = ClientManager()
 metadata_manager = MetadataManager()
 
 app = FastAPI()
+RELAY_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "relay")
+os.makedirs(RELAY_STORAGE_DIR, exist_ok=True)
+
+
+def _relay_chunk_path(chunk_id: str) -> str:
+    safe_chunk_id = os.path.basename(chunk_id)
+    return os.path.join(RELAY_STORAGE_DIR, safe_chunk_id)
 
 @app.get("/health")
 def health_check():
@@ -23,6 +31,47 @@ def health_check():
         "clients_connected": len(client_manager.get_all_clients()),
         "files_indexed": len(metadata_manager.list_files())
     }
+
+
+@app.post("/relay/store")
+def relay_store(payload: dict):
+    chunk_id = payload.get("chunk_id")
+    data = payload.get("data")
+    if not chunk_id or data is None:
+        return {"status": "error", "message": "Missing chunk_id or data"}
+
+    try:
+        raw = base64.b64decode(data)
+        with open(_relay_chunk_path(chunk_id), "wb") as f:
+            f.write(raw)
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/relay/get/{chunk_id}")
+def relay_get(chunk_id: str):
+    path = _relay_chunk_path(chunk_id)
+    if not os.path.exists(path):
+        return {"status": "error", "message": "Chunk not found"}
+
+    try:
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return {"status": "success", "data": encoded}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.delete("/relay/delete/{chunk_id}")
+def relay_delete(chunk_id: str):
+    path = _relay_chunk_path(chunk_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

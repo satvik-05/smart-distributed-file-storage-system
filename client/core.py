@@ -8,6 +8,8 @@ import json
 import websocket
 import re
 import glob
+import base64
+import urllib.request
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -76,6 +78,57 @@ class DistributedClient:
     def _recv_ws(self, ws):
         resp = ws.recv()
         return json.loads(resp) if resp else None
+
+    def _relay_base_url(self):
+        scheme = "https" if "onrender.com" in self.server_ip else "http"
+        target_port = 10000 if self.server_ip == "127.0.0.1" and self.server_port == 9000 else self.server_port
+        if scheme == "https":
+            return f"{scheme}://{self.server_ip}"
+        return f"{scheme}://{self.server_ip}:{target_port}"
+
+    def _relay_store_chunk(self, chunk_id, data):
+        try:
+            payload = json.dumps({
+                "chunk_id": chunk_id,
+                "data": base64.b64encode(data).decode("utf-8")
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._relay_base_url()}/relay/store",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return body.get("status") == "success"
+        except Exception:
+            return False
+
+    def _relay_get_chunk(self, chunk_id):
+        try:
+            req = urllib.request.Request(
+                f"{self._relay_base_url()}/relay/get/{chunk_id}",
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                if body.get("status") == "success" and body.get("data") is not None:
+                    return base64.b64decode(body["data"])
+        except Exception:
+            return None
+        return None
+
+    def _relay_delete_chunk(self, chunk_id):
+        try:
+            req = urllib.request.Request(
+                f"{self._relay_base_url()}/relay/delete/{chunk_id}",
+                method="DELETE"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return body.get("status") == "success"
+        except Exception:
+            return False
 
     # ── Register ──────────────────────────────────────────────────────────────
 
@@ -226,7 +279,7 @@ class DistributedClient:
                     for loc in locations:
                         log.log("PEER_UP", f"TCP connect  →  {loc['ip']}:{loc['port']}  [Chunk {idx+1}/{num_chunks}]")
                         t = threading.Thread(
-                            target=self._send_chunk_logged,
+                            target=self._send_chunk_with_fallback,
                             args=(loc['ip'], loc['port'], chunk_id, chunk_data, idx+1, num_chunks)
                         )
                         t.start()
@@ -246,6 +299,19 @@ class DistributedClient:
             log.log("PEER_DN", f"ACK ✓  {ip}:{port}  confirmed storage of chunk {idx}/{total}  (ID={chunk_id[:8]}...)")
         else:
             log.log("ERROR",   f"No ACK from {ip}:{port}  —  chunk {idx}/{total} may not be stored")
+
+    def _send_chunk_with_fallback(self, ip, port, chunk_id, data, idx, total):
+        success = send_chunk_to_peer(ip, port, chunk_id, data)
+        if success:
+            log.log("PEER_DN", f"ACK ✓  {ip}:{port}  confirmed storage of chunk {idx}/{total}  (ID={chunk_id[:8]}...)")
+            return
+
+        log.log("INFO", f"Direct peer path failed for chunk {idx}/{total} to {ip}:{port} — trying hub relay")
+        relay_ok = self._relay_store_chunk(chunk_id, data)
+        if relay_ok:
+            log.log("SERVER_DN", f"Relay stored chunk {idx}/{total} on Central Hub fallback path")
+        else:
+            log.log("ERROR", f"Relay store also failed for chunk {idx}/{total}")
 
     # ── Download ──────────────────────────────────────────────────────────────
 
@@ -307,6 +373,16 @@ class DistributedClient:
                         with lock:
                             downloaded_chunks.append(c_id)
                         return
+
+                log.log("INFO", f"All direct peers failed for chunk {chunk_num}/{len(chunk_ids)} — trying hub relay")
+                relay_data = self._relay_get_chunk(c_id)
+                if relay_data is not None:
+                    with open(chunk_path, "wb") as fh:
+                        fh.write(relay_data)
+                    log.log("SERVER_DN", f"Relay delivered chunk {chunk_num}/{len(chunk_ids)} from Central Hub")
+                    with lock:
+                        downloaded_chunks.append(c_id)
+                    return
 
                 log.log("ERROR", f"Chunk {chunk_num}/{len(chunk_ids)} unavailable from all peers — it may be offline")
 
@@ -447,6 +523,10 @@ class DistributedClient:
 
             if not locations:
                 log.log("INFO", "No active peer locations returned — metadata was the only record")
+                for i, chunk_id in enumerate(chunk_ids, start=1):
+                    relay_deleted = self._relay_delete_chunk(chunk_id)
+                    if relay_deleted:
+                        log.log("SERVER_DN", f"Relay fallback removed chunk {i}/{len(chunk_ids)} copy from Central Hub")
                 log.result(True, f"'{file_name}' removed from network index")
                 return
 
@@ -466,7 +546,12 @@ class DistributedClient:
                     if success:
                         log.log("PEER_DN", f"ACK ✓  {peer['ip']}:{peer['port']}  confirmed chunk {chunk_num} wiped from disk")
                     else:
-                        log.log("INFO",    f"Peer {peer['ip']}:{peer['port']} offline — chunk {chunk_num} is already orphaned")
+                        log.log("INFO",    f"Peer {peer['ip']}:{peer['port']} offline — trying relay delete for chunk {chunk_num}")
+                        relay_deleted = self._relay_delete_chunk(chunk_id)
+                        if relay_deleted:
+                            log.log("SERVER_DN", f"Relay fallback removed chunk {chunk_num} copy from Central Hub")
+                        else:
+                            log.log("INFO", f"Relay delete unavailable for chunk {chunk_num}; metadata was still purged")
 
             threads = []
             for i, chunk_id in enumerate(chunk_ids):

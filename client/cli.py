@@ -42,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description="Distributed File Storage Network — Client CLI")
     parser.add_argument("--storage", type=str, default="storage/default",
                         help="Local directory for storing chunk data (default: storage/default)")
-    parser.add_argument("--ip", type=str, default="smart-distributed-file-storage-system.onrender.com",
+    parser.add_argument("--ip", type=str, default="smart-distributed-file-storage-system-59bn.onrender.com",
                         help="Central Metadata Hub address (default: Render cloud)")
     parser.add_argument("--quiet", action="store_true",
                         help="Disable verbose architectural trace output")

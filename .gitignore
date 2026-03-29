@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments and configurations
+.env
+.client_id
+metadata.db
+
+# Storage chunk paths
+storage/
+data/
